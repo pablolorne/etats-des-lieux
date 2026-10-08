@@ -123,6 +123,14 @@ textarea{min-height:76px;resize:vertical}
 @media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .chip[aria-pressed="true"]{color:#0b1622}}
 .legend{display:flex;flex-wrap:wrap;gap:6px 12px;font-size:13px;color:var(--muted)}
 .legend b{font-family:var(--f-display);color:var(--ink)}
+.importbox{margin-top:14px;padding-top:14px;border-top:1px solid var(--line);display:grid;gap:8px}
+.okline{color:var(--eA);font-weight:700}
+.ref{font-size:13px;color:var(--muted);display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}
+.ref .t{font-family:var(--f-display);font-weight:800;font-size:12px;border-radius:5px;padding:1px 6px;color:#fff;background:var(--eNV)}
+.ref .t[data-v="A"]{background:var(--eA)}.ref .t[data-v="B"]{background:var(--eB)}.ref .t[data-v="C"]{background:var(--eC)}.ref .t[data-v="D"]{background:var(--eD)}.ref .t[data-v="HS"]{background:var(--eHS)}
+:root[data-theme="dark"] .ref .t{color:#0b1622}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .ref .t{color:#0b1622}}
+.refbox{background:var(--accent-soft);border-radius:10px;padding:10px 12px;font-size:13px;display:grid;gap:3px}
 .bulk{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:var(--accent-soft);border-radius:10px;padding:8px 10px;font-size:13px}
 
 /* photos */
@@ -187,6 +195,11 @@ textarea{min-height:76px;resize:vertical}
         <label for="cfgDate">Date de l'état des lieux</label>
         <input type="date" id="cfgDate">
       </div>
+      <div id="importBox" class="importbox" hidden>
+        <b>Reprendre l'état des lieux d'entrée</b>
+        <p class="hint" id="importHint">Importe le PDF d'entrée créé avec cette app : les pièces, les parties et le logement sont remplis, et chaque élément affiche ce qui avait été noté à l'entrée.</p>
+        <div><span class="btn sm primary addph">Importer le PDF d'entrée<input type="file" accept="application/pdf,.pdf" id="importPdf" aria-label="Importer le PDF d'entrée"></span></div>
+      </div>
     </div>
     <div class="card">
       <h2>Pièces du logement</h2>
@@ -244,13 +257,22 @@ const ELEMENTS=[
   ['chauffage','Chauffage'],
   ['ventilation','Ventilation']
 ];
+// Éléments retenus : pas de plafonnier, étanchéité, éclairage naturel, garde-corps.
+// Ventilation seulement en salle de bain et WC ; pas de volet en SdB/WC ; pas de chauffage dans les WC.
+const ELEMENT_SKIP={sdb:['volet'],wc:['volet','chauffage']};
+const DRY=['entree','sejour','sam','chambre','cuisine','couloir','autre'];
+function elementsFor(type){
+  return ELEMENTS.filter(([k])=>!['plafonnier','etancheite','eclairage','etancheite2','gardecorps'].includes(k)
+    &&!(k==='ventilation'&&DRY.includes(type))&&!(ELEMENT_SKIP[type]||[]).includes(k));
+}
+const typeOf=id=>id.replace(/-\d+$/,'');
 const EQUIP={
-  cuisine:[['evier','Évier','nombre de bacs, émail, alu…, couleur'],['robinetterie','Robinetterie, plomberie'],['siphon','Siphon - évacuation'],['joints','Joints'],['plaque','Plaque de cuisson'],['hotte','Hotte aspirante'],['four','Four'],['lavevaisselle','Lave-vaisselle'],['frigo','Réfrigérateur']],
+  cuisine:[['evier','Évier','nombre de bacs, émail, alu…, couleur'],['robinetterie','Robinetterie, plomberie'],['joints','Joints'],['plaque','Plaque de cuisson'],['hotte','Hotte aspirante'],['four','Four'],['lavevaisselle','Lave-vaisselle'],['frigo','Réfrigérateur']],
   sdb:[['lavabo','Lavabo'],['douche','Douche'],['baignoire','Baignoire']],
   wc:[['cuvette','Cuvette'],['plomberie','Plomberie'],['chasse','Mécanisme chasse d\'eau'],['lavemains','Lave-mains'],['joints','Joints']]
 };
 const SDB_SUB=[['plomberie','Plomberie / robinetterie'],['siphon','Siphon / évacuation'],['flexible','Flexible / pommeau'],['joints','Joints']];
-const ACCESSOIRES=[['sonnerie','Sonnerie'],['boite','Boîte aux lettres'],['detecteur','Détecteur de fumée (obligatoire)'],['antenne','Antenne TV'],['internet','Internet'],['interphone','Interphone'],['portail','Portail électrique']];
+const ACCESSOIRES=[['sonnerie','Sonnerie'],['boite','Boîte aux lettres'],['detecteur','Détecteur de fumée (obligatoire)'],['internet','Internet']];
 
 /* ---------- État ---------- */
 const today=()=>{const d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')};
@@ -258,7 +280,38 @@ function blank(){
   const counts={};TYPES.forEach(t=>counts[t.k]=t.def);
   return {v:1,type:'entree',date:today(),counts,rooms:{},
     parties:{qualite:'bailleur'},locaux:{type:'Appartement'},acces:[{type:'Clé',dest:'Porte d\'entrée',nb:''}],
-    acc:{},chauf:{},cpt:{},clos:{},annexes:{},fin:{exemplaires:'2'},photosGen:[]};
+    acc:{},chauf:{},cpt:{},clos:{},annexes:{},fin:{exemplaires:'2'},photosGen:[],ref:null};
+}
+
+/* ---------- Données de l'entrée, intégrées au PDF puis relues à la sortie ---------- */
+const MARK='EDLDATA1:';
+function entreePayload(){
+  const P=JSON.parse(JSON.stringify(S));
+  stripPhotos(P);delete P.ref;if(P.fin){delete P.fin.sigB;delete P.fin.sigL}
+  const bytes=new TextEncoder().encode(JSON.stringify(P));let bin='';
+  for(let i=0;i<bytes.length;i+=8192)bin+=String.fromCharCode.apply(null,bytes.subarray(i,i+8192));
+  return MARK+btoa(bin);
+}
+async function readEntreePdf(file){
+  const buf=new Uint8Array(await file.arrayBuffer());let txt='';
+  for(let i=0;i<buf.length;i+=8192)txt+=String.fromCharCode.apply(null,buf.subarray(i,i+8192));
+  const m=txt.match(/EDLDATA1:([A-Za-z0-9+\/=\s\\]+)/);
+  if(!m)throw new Error('nodata');
+  const b64=m[1].replace(/[\s\\]/g,'');const bin=atob(b64);
+  const bytes=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+function applyEntree(P){
+  const n=blank();n.type='sortie';n.date=today();
+  n.counts=Object.assign(n.counts,P.counts||{});
+  n.parties=P.parties||n.parties;n.locaux=P.locaux||n.locaux;n.acces=(P.acces&&P.acces.length)?P.acces:n.acces;
+  n.chauf=Object.assign({},P.chauf||{},{photos:[]});n.clos=P.clos||{};n.annexes=Object.assign({},P.annexes||{},{photos:[]});
+  for(const k in (P.acc||{})){if(P.acc[k]&&typeof P.acc[k]==='object')n.acc[k]={on:!!P.acc[k].on}}
+  for(const id in (P.rooms||{})){const R=P.rooms[id]||{};const eq={};for(const k in (R.eq||{}))eq[k]={on:!!R.eq[k].on};
+    n.rooms[id]={el:{},eq,eau:Object.assign({},R.eau||{}),photos:[],obs:'',name:R.name||''}}
+  n.fin={exemplaires:(P.fin&&P.fin.exemplaires)||'2',faitA:(P.fin&&P.fin.faitA)||''};
+  n.ref={date:P.date||'',rooms:P.rooms||{},acc:P.acc||{},cpt:P.cpt||{}};
+  S=n;
 }
 let S=blank();
 let started=false;
@@ -288,6 +341,8 @@ function setMsg(m){const el=$('#barMsg');if(el)el.textContent=m}
 function renderSetup(){
   document.querySelectorAll('#segType button').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.type===S.type)));
   $('#cfgDate').value=S.date||'';
+  $('#importBox').hidden=S.type!=='sortie';
+  $('#importHint').innerHTML=S.ref?`<span class="okline">✓ État des lieux d'entrée${S.ref.date?' du '+fmtDate(S.ref.date):''} importé.</span> Tu peux en importer un autre pour le remplacer.`:'Importe le PDF d\'entrée créé avec cette app : les pièces, les parties et le logement sont remplis, et chaque élément affiche ce qui avait été noté à l\'entrée.';
   $('#steppers').innerHTML=TYPES.map(t=>`
     <div class="stepper">
       <div class="lbl"><b>${t.label}${t.k==='chambre'||t.k==='autre'||t.k==='couloir'?'s':''}</b>${t.hint?`<span>${t.hint}</span>`:''}</div>
@@ -311,6 +366,16 @@ $('#steppers').addEventListener('click',e=>{
 });
 $('#segType').addEventListener('click',e=>{const b=e.target.closest('[data-type]');if(!b)return;S.type=b.dataset.type;renderSetup();saveDraft()});
 $('#cfgDate').addEventListener('input',e=>{S.date=e.target.value;saveDraft()});
+$('#importPdf').addEventListener('change',async e=>{
+  const f=e.target.files[0];e.target.value='';if(!f)return;
+  try{
+    const P=await readEntreePdf(f);
+    if(P.type==='sortie'){toast('Ce PDF est un état des lieux de sortie. Choisis le PDF d\'entrée.');return}
+    applyEntree(P);renderSetup();saveDraft();
+    const n=Object.values(S.ref.rooms).length;
+    toast(`Entrée${S.ref.date?' du '+fmtDate(S.ref.date):''} importée : ${n} pièce${n>1?'s':''}`);
+  }catch(err){toast(err.message==='nodata'?'Ce PDF ne contient pas de données lisibles. Utilise un PDF d\'entrée créé avec la dernière version de l\'app.':'Le PDF n\'a pas pu être lu.')}
+});
 $('#btnStart').addEventListener('click',()=>{started=true;showForm()});
 $('#btnRooms').addEventListener('click',()=>{showSetup()});
 
@@ -347,6 +412,17 @@ function photoBlock(p,label='Photos'){
   <div><span class="btn sm addph">+ Ajouter des photos<input type="file" accept="image/*" multiple data-photos="${p}" aria-label="Ajouter des photos"></span></div></div>`;
 }
 function thumbs(p){return (getP(p)||[]).map((ph,i)=>`<div class="thumb"><img src="${ph.src}" alt=""><button type="button" class="x" data-delph="${p}" data-i="${i}" aria-label="Supprimer la photo">×</button><input type="text" placeholder="Légende" data-k="${p}.${i}.cap" value="${esc(ph.cap||'')}"></div>`).join('')}
+function refLine(e,d){
+  if(S.type!=='sortie'||!S.ref)return '';
+  return `<div class="ref"><span>À l'entrée :</span>${e?`<span class="t" data-v="${esc(e)}">${esc(e)}</span>`:'<span>non noté</span>'}${d?`<span>${esc(d)}</span>`:''}</div>`;
+}
+function eqDesc(q,sdb){
+  if(!q)return '';
+  const parts=[];if(q.d)parts.push(q.d);
+  if(sdb&&q.sub){const s=SDB_SUB.filter(([k])=>q.sub[k]).map(([k,l])=>l.split(' /')[0]+' '+q.sub[k]);if(s.length)parts.push(s.join(', '))}
+  if(!parts.length&&q.on)parts.push('Présent');
+  return parts.join(' - ');
+}
 function sec(id,title,body,{open=false,meta=''}={}){
   return `<details class="sec" id="s-${id}" ${open?'open':''}><summary><h2>${title}</h2><span class="meta" id="meta-${id}">${meta}</span></summary><div class="body">${body}</div></details>`;
 }
@@ -389,28 +465,24 @@ function accesRows(){
     <button type="button" class="iconbtn" data-delacc="${i}" aria-label="Supprimer la ligne">×</button></div>`).join('');
 }
 function secAccessoires(){
-  return ACCESSOIRES.map(([k,l])=>`<div class="el eq"><div class="hd"><span class="nm"><input type="checkbox" data-k="acc.${k}.on" ${getP('acc.'+k+'.on')?'checked':''} aria-label="Présent">${l}</span>${chips('acc.'+k+'.e')}</div><input type="text" data-k="acc.${k}.d" value="${val('acc.'+k+'.d')}" placeholder="Remarque" aria-label="Remarque ${esc(l)}"></div>`).join('')+
+  return ACCESSOIRES.map(([k,l])=>`<div class="el eq"><div class="hd"><span class="nm"><input type="checkbox" data-k="acc.${k}.on" ${getP('acc.'+k+'.on')?'checked':''} aria-label="Présent">${l}</span>${chips('acc.'+k+'.e')}</div>${S.ref?refLine(S.ref.acc[k]?.e,eqDesc(S.ref.acc[k])):''}<input type="text" data-k="acc.${k}.d" value="${val('acc.'+k+'.d')}" placeholder="Remarque" aria-label="Remarque ${esc(l)}"></div>`).join('')+
   area('acc.autres','Autres accessoires');
 }
 function secChauffage(){
   return `<div class="checks">${ck('chauf.collectif','Chauffage collectif')}${ck('chauf.indiv','Chaudière individuelle')}</div>
-  <div class="checks">${ck('chauf.indivChauffage','Chauffage')}${ck('chauf.indivEau','Chauffe-eau')}${ck('chauf.fuel','Fuel')}${ck('chauf.gaz','Gaz')}${ck('chauf.elec','Électrique')}</div>
-  <div class="grid2">${inp('chauf.localisation','Localisation')}${inp('chauf.etat','État général')}</div>
-  ${inp('chauf.robinetterie','État robinetterie et plomberie')}
-  ${inp('chauf.evacuation','État du circuit d\'évacuation des produits de combustion')}
-  <div class="grid2">${inp('chauf.entretien','Dernière visite d\'entretien le',{type:'date'})}${inp('chauf.ramonage','Ramonage effectué le',{type:'date'})}</div>
-  <div class="sub">Émetteurs</div>
-  <div class="grid2">${inp('chauf.radiateurs','Nombre de radiateurs à eau',{im:'numeric'})}${inp('chauf.convecteurs','Nombre de convecteurs électriques',{im:'numeric'})}</div>
+  ${inp('chauf.etat','État général')}
   <div class="sub">Ballon d'eau chaude</div>
   <div class="grid2">${inp('chauf.ballonL','Ballon (litres)',{im:'numeric'})}${inp('chauf.ballonLoc','Localisation')}</div>
   ${inp('chauf.ballonEtat','État général du ballon')}
-  <div class="sub">Cheminée(s)</div>
-  <div class="grid2">${inp('chauf.cheminees','Nombre de cheminées',{im:'numeric'})}${inp('chauf.cheminRamonage','Dernier ramonage le',{type:'date'})}</div>
   ${area('chauf.obs','Remarques')}
   ${photoBlock('chauf.photos')}`;
 }
 function secCompteurs(){
-  return `<div class="sub" style="border:0;padding:0">Électricité</div>
+  const C=S.ref&&S.type==='sortie'?S.ref.cpt:null;
+  const refc=C?`<div class="refbox"><b>Relevés à l'entrée${S.ref.date?' ('+fmtDate(S.ref.date)+')':''}</b>
+    <span>Électricité : ${esc([C.elecHP&&'HP/base '+C.elecHP,C.elecHC&&'HC '+C.elecHC].filter(Boolean).join(', ')||'-')}</span>
+    <span>Gaz : ${esc(C.gazReleve||'-')}</span><span>Eau chaude : ${esc(C.eauChaude||'-')} · Eau froide : ${esc(C.eauFroide||'-')}</span></div>`:'';
+  return `${refc}<div class="sub" style="border:0;padding:0">Électricité</div>
   ${inp('cpt.elecInfo','Compagnie, localisation, n° de compteur')}
   <div class="grid2">${inp('cpt.elecPuissance','Puissance',{ph:'ex. 6 kVA'})}${inp('cpt.elecHP','Relevé (heures pleines / base)',{im:'decimal'})}</div>
   <div class="grid2">${inp('cpt.elecHC','Relevé heures creuses',{im:'decimal'})}${inp('cpt.elecDate','Relevé le',{type:'date'})}</div>
@@ -457,8 +529,10 @@ function secRoom(r){
   let h='';
   if(r.type==='autre')h+=inp(b+'.name','Nom de la pièce',{ph:'Bureau, buanderie, cellier…'});
   if(r.type==='cuisine'||r.type==='sdb')h+=`<div class="f"><span class="lab">Eau potable</span><div class="checks">${ck(b+'.eau.froide','Froide')}${ck(b+'.eau.chaude','Chaude')}</div></div>`;
-  h+=`<div class="bulk"><span>Tout mettre en</span>${ETATS.slice(0,4).map(v=>`<button type="button" class="chip" data-bulk="${r.id}" data-v="${v}">${v}</button>`).join('')}<span style="color:var(--muted)">(seulement les éléments vides)</span></div>`;
-  h+='<div>'+ELEMENTS.map(([k,l,s])=>`<div class="el"><div class="hd"><span class="nm">${l}${s?`<i>${s}</i>`:''}</span>${chips(`${b}.el.${k}.e`)}</div><input type="text" data-k="${b}.el.${k}.d" value="${val(`${b}.el.${k}.d`)}" placeholder="Description" aria-label="Description ${esc(l)}"></div>`).join('')+'</div>';
+  const RR=(S.type==='sortie'&&S.ref&&S.ref.rooms[r.id])||null;
+  if(S.type==='sortie'&&S.ref&&!RR)h+=`<p class="hint">Cette pièce n'existait pas dans l'état des lieux d'entrée.</p>`;
+  h+=`<div class="bulk"><span>Tout mettre en</span>${ETATS.slice(0,4).map(v=>`<button type="button" class="chip" data-bulk="${r.id}" data-v="${v}">${v}</button>`).join('')}${RR?`<button type="button" class="btn sm" data-same="${r.id}">Comme à l'entrée</button>`:''}<span style="color:var(--muted)">(seulement les éléments vides)</span></div>`;
+  h+='<div>'+elementsFor(r.type).map(([k,l,s])=>`<div class="el"><div class="hd"><span class="nm">${l}${s?`<i>${s}</i>`:''}</span>${chips(`${b}.el.${k}.e`)}</div>${RR?refLine(RR.el?.[k]?.e,RR.el?.[k]?.d):''}<input type="text" data-k="${b}.el.${k}.d" value="${val(`${b}.el.${k}.d`)}" placeholder="Description" aria-label="Description ${esc(l)}"></div>`).join('')+'</div>';
   const eq=EQUIP[r.type];
   if(eq){
     h+=`<div class="sub">Équipements${r.type==='cuisine'?' de la cuisine':r.type==='sdb'?' de la salle de bain':' du WC'}</div><div>`;
@@ -466,7 +540,8 @@ function secRoom(r){
       const p=`${b}.eq.${k}`;
       let sub='';
       if(r.type==='sdb')sub=`<div class="subetats">${SDB_SUB.map(([sk,sl])=>`<div class="row"><span>${sl}</span>${chips(`${p}.sub.${sk}`)}</div>`).join('')}</div>`;
-      return `<div class="el eq"><div class="hd"><span class="nm"><input type="checkbox" data-k="${p}.on" ${getP(p+'.on')?'checked':''} aria-label="Présent">${l}${s?`<i style="margin-left:4px">${s}</i>`:''}</span>${chips(p+'.e')}</div>${sub}<input type="text" data-k="${p}.d" value="${val(p+'.d')}" placeholder="Remarque" aria-label="Remarque ${esc(l)}"></div>`;
+      const rq=RR&&RR.eq?RR.eq[k]:null;
+      return `<div class="el eq"><div class="hd"><span class="nm"><input type="checkbox" data-k="${p}.on" ${getP(p+'.on')?'checked':''} aria-label="Présent">${l}${s?`<i style="margin-left:4px">${s}</i>`:''}</span>${chips(p+'.e')}</div>${RR?refLine(rq?.e,eqDesc(rq,r.type==='sdb')):''}${sub}<input type="text" data-k="${p}.d" value="${val(p+'.d')}" placeholder="Remarque" aria-label="Remarque ${esc(l)}"></div>`;
     }).join('')+'</div>';
     h+=area(b+'.eqAutres','Autres équipements');
   }
@@ -476,10 +551,10 @@ function secRoom(r){
 }
 function roomMeta(id){
   const R=S.rooms[id];if(!R)return '';
-  const n=ELEMENTS.filter(([k])=>R.el&&R.el[k]&&R.el[k].e).length;const ph=(R.photos||[]).length;
-  return `${n}/${ELEMENTS.length}${ph?` · ${ph} photo${ph>1?'s':''}`:''}`;
+  const EL=elementsFor(typeOf(id));const n=EL.filter(([k])=>R.el&&R.el[k]&&R.el[k].e).length;const ph=(R.photos||[]).length;
+  return `${n}/${EL.length}${ph?` · ${ph} photo${ph>1?'s':''}`:''}`;
 }
-function updateMeta(id){const m=$('#meta-'+id);if(!m)return;m.textContent=roomMeta(id);m.classList.toggle('done',S.rooms[id]&&ELEMENTS.every(([k])=>S.rooms[id].el?.[k]?.e))}
+function updateMeta(id){const m=$('#meta-'+id);if(!m)return;m.textContent=roomMeta(id);m.classList.toggle('done',S.rooms[id]&&elementsFor(typeOf(id)).every(([k])=>S.rooms[id].el?.[k]?.e))}
 
 /* ---------- Rendu du formulaire ---------- */
 let SECTIONS=[];
@@ -529,9 +604,15 @@ form.addEventListener('click',e=>{
     // cocher "présent" automatiquement quand on note un équipement
     const q=p.match(/^(.*\.eq\.[^.]+|acc\.[^.]+)\.e$/);if(q&&v){setP(q[1]+'.on',true);const cb=form.querySelector(`[data-k="${q[1]}.on"]`);if(cb)cb.checked=true}
     saveDraft();return}
+  const sm=e.target.closest('[data-same]');
+  if(sm){const id=sm.dataset.same;const R=ensureRoom(id);const RR=S.ref&&S.ref.rooms[id];if(!RR)return;let n=0;
+    const copy=(path,v)=>{if(!v||getP(path))return;setP(path,v);n++;form.querySelectorAll(`[data-chip="${path}"]`).forEach(x=>x.setAttribute('aria-pressed',String(x.dataset.v===v)))};
+    elementsFor(typeOf(id)).forEach(([k])=>copy(`rooms.${id}.el.${k}.e`,RR.el?.[k]?.e));
+    for(const k in (RR.eq||{})){copy(`rooms.${id}.eq.${k}.e`,RR.eq[k].e);for(const sk in (RR.eq[k].sub||{}))copy(`rooms.${id}.eq.${k}.sub.${sk}`,RR.eq[k].sub[sk])}
+    updateMeta(id);toast(n?`${n} note${n>1?'s':''} reprise${n>1?'s':''} de l'entrée`:'Rien à reprendre : tout est déjà noté');saveDraft();return}
   const bk=e.target.closest('[data-bulk]');
   if(bk){const id=bk.dataset.bulk;const R=ensureRoom(id);let n=0;
-    ELEMENTS.forEach(([k])=>{if(!R.el[k])R.el[k]={};if(!R.el[k].e){R.el[k].e=bk.dataset.v;n++;
+    elementsFor(typeOf(id)).forEach(([k])=>{if(!R.el[k])R.el[k]={};if(!R.el[k].e){R.el[k].e=bk.dataset.v;n++;
       form.querySelectorAll(`[data-chip="rooms.${id}.el.${k}.e"]`).forEach(x=>x.setAttribute('aria-pressed',String(x.dataset.v===bk.dataset.v)))}});
     updateMeta(id);toast(n?`${n} élément${n>1?'s':''} noté${n>1?'s':''} ${bk.dataset.v}`:'Tous les éléments sont déjà notés');saveDraft();return}
   const dp=e.target.closest('[data-delph]');
@@ -627,6 +708,19 @@ async function buildPdf(){
   doc.setFont('helvetica','normal');doc.setFontSize(7.8);doc.setTextColor(90,106,124);
   doc.text('Nomenclature : A très bon état - B bon état - C état moyen - D mauvais état - HS hors service - NV non vérifié',M,y+19);
   doc.setTextColor(...INK);y+=24;
+  if(S.type==='sortie'&&S.ref){doc.setFontSize(8.6);doc.text(T(`Établi en comparaison avec l'état des lieux d'entrée${S.ref.date?' du '+fmtDate(S.ref.date):''}.`),M,y-1.5);y+=4}
+  const E=S.type==='entree'?S:(S.ref||null);const X=S.type==='sortie'?S:null;
+  function cmpTable(first,rows,firstW=40){
+    doc.autoTable({...base,startY:y,
+      head:[[{content:T(first),rowSpan:2,styles:{valign:'middle'}},{content:T("État d'entrée"),colSpan:2,styles:{halign:'center'}},{content:T('État de sortie'),colSpan:2,styles:{halign:'center'}}],
+            ['Description',T('État'),'Description',T('État')]],
+      body:rows.map(r=>r.map(c=>T(c||''))),
+      bodyStyles:{minCellHeight:6.6},
+      columnStyles:{0:{cellWidth:firstW,fontStyle:'bold'},2:{cellWidth:12},4:{cellWidth:12}},
+      didParseCell:etatCell([2,4]),
+      didDrawCell:data=>{if(data.column.index===3){doc.setDrawColor(...BLUE);doc.setLineWidth(.6);doc.line(data.cell.x,data.cell.y,data.cell.x,data.cell.y+data.cell.height);doc.setLineWidth(.2)}}});
+    y=doc.lastAutoTable.finalY+4;
+  }
 
   h1('Parties');
   kv([[S.parties.qualite==='mandataire'?'Mandataire':'Bailleur',S.parties.bailleur],S.parties.qualite==='mandataire'||S.parties.bailleurMandant?['Bailleur (si mandataire)',S.parties.bailleurMandant]:null,['Locataire(s)',S.parties.locataires],S.type==='sortie'?['Nouvelle adresse du locataire',S.nouvelleAdresse]:null]);
@@ -639,23 +733,28 @@ async function buildPdf(){
   table(['Type','Destination','Nombre'],acc.length?acc.map(a=>[a.type,a.dest,a.nb]):[['-','-','-']],{columnStyles:{2:{cellWidth:22,halign:'center'}}});
 
   h1('Accessoires');
-  table(['Accessoire','Présent','État','Remarque'],ACCESSOIRES.map(([k,l])=>{const a=S.acc[k]||{};return [l,a.on?'Oui':'Non',a.e||'',a.d||'']}),{columnStyles:{1:{cellWidth:18,halign:'center'},2:{cellWidth:16}},didParseCell:etatCell(2)});
+  cmpTable('Accessoire',ACCESSOIRES.map(([k,l])=>{const a=E&&E.acc?E.acc[k]:null,b=X&&X.acc?X.acc[k]:null;return [l,eqDesc(a),a&&a.e,eqDesc(b),b&&b.e]}),44);
   para('Autres accessoires',S.acc.autres);
 
   h1('État des éléments de chauffage');
   const C=S.chauf;const mode=[C.collectif&&'Chauffage collectif',C.indiv&&'Chaudière individuelle'].filter(Boolean).join(', ');
-  const usage=[C.indivChauffage&&'chauffage',C.indivEau&&'chauffe-eau'].filter(Boolean).join(', ');const nrj=[C.fuel&&'fuel',C.gaz&&'gaz',C.elec&&'électrique'].filter(Boolean).join(', ');
-  kv([['Type',mode],['Usage / énergie',[usage,nrj].filter(Boolean).join(' - ')],['Localisation',C.localisation],['État général',C.etat],['Robinetterie et plomberie',C.robinetterie],['Évacuation des produits de combustion',C.evacuation],['Dernière visite d\'entretien',fmtDate(C.entretien)],['Ramonage effectué le',fmtDate(C.ramonage)],['Radiateurs à eau',C.radiateurs],['Convecteurs électriques',C.convecteurs],['Ballon',C.ballonL?C.ballonL+' litres':''],['Localisation du ballon',C.ballonLoc],['État général du ballon',C.ballonEtat],['Cheminée(s)',C.cheminees],['Dernier ramonage cheminée',fmtDate(C.cheminRamonage)]]);
+    kv([['Type',mode],['État général',C.etat],['Ballon',C.ballonL?C.ballonL+' litres':''],['Localisation du ballon',C.ballonLoc],['État général du ballon',C.ballonEtat]]);
   para('Remarques',C.obs);await photos(C.photos);
 
   h1('Relevé des compteurs');
-  const P=S.cpt;
-  table(['Compteur','Compagnie / localisation','Puissance','Relevé','Date'],[
-    ['Électricité',P.elecInfo,P.elecPuissance,[P.elecHP&&('HP/base : '+P.elecHP),P.elecHC&&('HC : '+P.elecHC)].filter(Boolean).join('\n'),fmtDate(P.elecDate)],
-    ['Gaz',P.gazInfo,'',P.gazReleve,fmtDate(P.gazDate)],
-    ['Eau chaude',P.eauInfo,'',P.eauChaude,fmtDate(P.eauChaudeDate)],
-    ['Eau froide',P.eauInfo,'',P.eauFroide,fmtDate(P.eauFroideDate)]
-  ],{columnStyles:{0:{cellWidth:24,fontStyle:'bold'},2:{cellWidth:22},4:{cellWidth:22}}});
+  const P=S.cpt,PE=(E&&E.cpt)||{},PX=(X&&X.cpt)||{};
+  const elecR=c=>[c.elecHP&&('HP/base : '+c.elecHP),c.elecHC&&('HC : '+c.elecHC)].filter(Boolean).join('\n');
+  const info=(k)=>P[k]||PE[k]||'';
+  doc.autoTable({...base,startY:y,
+    head:[[{content:'Compteur',rowSpan:2,styles:{valign:'middle'}},{content:'Compagnie / localisation',rowSpan:2,styles:{valign:'middle'}},{content:T("Relevé d'entrée"),colSpan:2,styles:{halign:'center'}},{content:T('Relevé de sortie'),colSpan:2,styles:{halign:'center'}}],['Index','Date','Index','Date']],
+    body:[
+      ['Électricité',[info('elecInfo'),(P.elecPuissance||PE.elecPuissance)&&('Puissance : '+(P.elecPuissance||PE.elecPuissance))].filter(Boolean).join('\n'),elecR(PE),fmtDate(PE.elecDate),elecR(PX),fmtDate(PX.elecDate)],
+      ['Gaz',info('gazInfo'),PE.gazReleve,fmtDate(PE.gazDate),PX.gazReleve,fmtDate(PX.gazDate)],
+      ['Eau chaude',info('eauInfo'),PE.eauChaude,fmtDate(PE.eauChaudeDate),PX.eauChaude,fmtDate(PX.eauChaudeDate)],
+      ['Eau froide',info('eauInfo'),PE.eauFroide,fmtDate(PE.eauFroideDate),PX.eauFroide,fmtDate(PX.eauFroideDate)]
+    ].map(r=>r.map(c=>T(c||''))),bodyStyles:{minCellHeight:6.6},
+    columnStyles:{0:{cellWidth:22,fontStyle:'bold'},3:{cellWidth:19},5:{cellWidth:19}}});
+  y=doc.lastAutoTable.finalY+4;
   await photos(P.photos,'Photos des compteurs');
 
   /* Pièces */
@@ -664,17 +763,16 @@ async function buildPdf(){
     doc.addPage();y=M;
     h1(r.label);
     if(r.type==='cuisine'||r.type==='sdb'){doc.setFontSize(8.6);doc.setFont('helvetica','normal');doc.text(T(`Eau potable : froide ${R.eau?.froide?'[x]':'[ ]'}   chaude ${R.eau?.chaude?'[x]':'[ ]'}`),M,y+2.5);y+=6}
-    table(['Élément','Description','État'],ELEMENTS.map(([k,l])=>[l,R.el?.[k]?.d||'',R.el?.[k]?.e||'']),{columnStyles:{0:{cellWidth:44,fontStyle:'bold'},2:{cellWidth:14}},didParseCell:etatCell(2)});
+    const RE=E&&E.rooms?E.rooms[r.id]:null,RX=X&&X.rooms?X.rooms[r.id]:null;
+    cmpTable('Élément',elementsFor(r.type).map(([k,l])=>[l,RE&&RE.el&&RE.el[k]&&RE.el[k].d,RE&&RE.el&&RE.el[k]&&RE.el[k].e,RX&&RX.el&&RX.el[k]&&RX.el[k].d,RX&&RX.el&&RX.el[k]&&RX.el[k].e]));
     const eq=EQUIP[r.type];
     if(eq){
-      if(r.type==='sdb'){
-        table(['Équipement','Présent','État','Plomb./robin.','Siphon/évac.','Flexible/pommeau','Joints','Remarque'],eq.map(([k,l])=>{const q=R.eq?.[k]||{};const s=q.sub||{};return [l,q.on?'Oui':'Non',q.e||'',s.plomberie||'',s.siphon||'',s.flexible||'',s.joints||'',q.d||'']}),
-          {styles:{...base.styles,fontSize:7.8},columnStyles:{0:{cellWidth:22,fontStyle:'bold'},1:{cellWidth:14,halign:'center'},2:{cellWidth:12},3:{cellWidth:18},4:{cellWidth:18},5:{cellWidth:20},6:{cellWidth:13}},didParseCell:etatCell([2,3,4,5,6])});
-      }else{
-        table(['Équipement','Présent','État','Remarque'],eq.map(([k,l])=>{const q=R.eq?.[k]||{};return [l,q.on?'Oui':'Non',q.e||'',q.d||'']}),{columnStyles:{0:{cellWidth:44,fontStyle:'bold'},1:{cellWidth:18,halign:'center'},2:{cellWidth:14}},didParseCell:etatCell(2)});
-      }
-      para('Autres équipements',R.eqAutres);
+      const sdb=r.type==='sdb';
+      cmpTable('Équipement',eq.map(([k,l])=>{const a=RE&&RE.eq?RE.eq[k]:null,b=RX&&RX.eq?RX.eq[k]:null;return [l,eqDesc(a,sdb),a&&a.e,eqDesc(b,sdb),b&&b.e]}));
+      if(RE&&RE.eqAutres&&X)para('Autres équipements (entrée)',RE.eqAutres);
+      para(X?'Autres équipements (sortie)':'Autres équipements',R.eqAutres);
     }
+    if(X&&RE&&RE.obs)para('Observations à l\'entrée',RE.obs);
     para(S.type==='sortie'?'Observations / évolution de l\'état à la sortie':'Observations',R.obs);
     await photos(R.photos);
   }
@@ -708,6 +806,7 @@ async function buildPdf(){
     doc.text(T(`État des lieux ${S.type==='sortie'?'de sortie':'d\'entrée'}${addr?' - '+addr:''}`),M,PH-8);
     doc.text(`Page ${i} / ${n}`,PW-M,PH-8,{align:'right'});
     doc.text('Paraphes :',PW-M-60,PH-8);}
+  doc.setProperties({title:'État des lieux',subject:T(`Etat des lieux ${S.type==='sortie'?'de sortie':"d'entree"}`),creator:'App etat des lieux',keywords:S.type==='entree'?entreePayload():''});
   return doc;
 }
 
